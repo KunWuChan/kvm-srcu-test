@@ -59,7 +59,7 @@ POST_RUN_SETTLE_S=45 bash run_srcu_kvm_repro_fixed_profile.sh 0
 POST_RUN_SETTLE_S=45 bash run_srcu_kvm_repro_fixed_profile.sh 1
 ```
 
-## 5) Output and Interpretation / 输出与解读
+## 5) Output and Interpretation
 
 - Main outputs: `selftest.stdout` and `bpftrace.out`.
 - Compare `@call_ioeventfd_cnt` and `@call_main_cnt` between `storm=0` and `storm=1`.
