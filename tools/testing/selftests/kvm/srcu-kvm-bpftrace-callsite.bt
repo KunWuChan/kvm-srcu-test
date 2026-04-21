@@ -1,0 +1,386 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * SRCU/KVM callsite-precise edition
+ *
+ * Core idea:
+ * 1) record call requests at srcu_gp_start_if_needed() entry
+ * 2) capture return value s (GP identity) in kretprobe
+ * 3) reduce strictly by (ssp,s) at srcu_bpf_gp_end*
+ * 4) tag callsite by KVM stack depth (memslot/ioeventfd)
+ *
+ * kvm->srcu-specific mode (not system-wide SRCU):
+ * - on the first tagged memslot/ioeventfd GP, store arg0==&kvm->srcu as @kvm_ssp
+ * - srcu_bpf_reader_* is counted into @kvm_reader_* only when (uint64)arg0==@kvm_ssp
+ * - after ssp is locked, all GPs on that pointer (including untagged callsites) track do_norm via @gp_dn_kvm
+ *   do_norm==1 is treated as in-flight normal GP; before incrementing this normal GP, if tagged and do_norm==0
+ *   and inflight>0, mark @exp_overlap_pending; at gp_end, emit
+ *   @kvm_exp_wait_after_norm_inflight_us using call_start_ts (entry to gp_end, in usec)
+ * - if rcu_gp_is_normal() forces do_norm==1 on expedited sync path, interpret exp/normal semantics with kernel context
+ */
+
+BEGIN
+{
+	printf("SRCU callsite bpftrace started.\n");
+	printf("Pairing: same ssp + same s.\n");
+	printf("Callsite: memslot kvm_swap_active_memslots.\n");
+	printf("Callsite: ioeventfd kvm_io_bus_register_dev.\n");
+	printf("kvm ssp: first tagged GP locks ptr.\n");
+	printf("overlap: tagged exp if norm inflight; hist at end.\n");
+}
+
+kprobe:kvm_swap_active_memslots
+{
+	@cs_memslot_depth[tid] = @cs_memslot_depth[tid] + 1;
+	@cs_memslot_hit = count();
+}
+
+kretprobe:kvm_swap_active_memslots
+/@cs_memslot_depth[tid]/
+{
+	@cs_memslot_depth[tid] = @cs_memslot_depth[tid] - 1;
+	if (@cs_memslot_depth[tid] == 0) {
+		delete(@cs_memslot_depth[tid]);
+	}
+}
+
+kprobe:kvm_io_bus_register_dev
+{
+	@cs_ioeventfd_depth[tid] = @cs_ioeventfd_depth[tid] + 1;
+	@cs_ioeventfd_hit = count();
+}
+
+kretprobe:kvm_io_bus_register_dev
+/@cs_ioeventfd_depth[tid]/
+{
+	@cs_ioeventfd_depth[tid] = @cs_ioeventfd_depth[tid] - 1;
+	if (@cs_ioeventfd_depth[tid] == 0) {
+		delete(@cs_ioeventfd_depth[tid]);
+	}
+}
+
+kprobe:srcu_bpf_reader_lock
+{
+	@reader_ssp[tid, (uint64)arg1, (uint64)arg2] = (uint64)arg0;
+	@reader_start[tid, (uint64)arg1, (uint64)arg2] = nsecs;
+}
+
+kprobe:srcu_bpf_reader_unlock
+{
+	$k1 = (uint64)arg1;
+	$k2 = (uint64)arg2;
+	$start = @reader_start[tid, $k1, $k2];
+	if ($start) {
+		$dur = nsecs - $start;
+		$ssp = @reader_ssp[tid, $k1, $k2];
+		@reader_total = count();
+		@reader_dur_us = hist($dur / 1000);
+		if (@target_ssp[$ssp]) {
+			@reader_target_cnt = count();
+			@reader_target_dur_us = hist($dur / 1000);
+		}
+		// kvm->srcu only: ssp must match the first locked @kvm_ssp
+		if (@kvm_ssp_ready[0] && (uint64)$ssp == @kvm_ssp) {
+			@kvm_kvm_reader_cnt = count();
+			@kvm_reader_dur_us = hist($dur / 1000);
+			if ($dur / 1000 >= 1000) {
+				@kvm_reader_ge_1ms = count();
+			}
+			if ($dur / 1000 >= 4000) {
+				@kvm_reader_ge_4ms = count();
+			}
+		}
+		delete(@reader_start[tid, $k1, $k2]);
+		delete(@reader_ssp[tid, $k1, $k2]);
+	}
+}
+
+kprobe:srcu_gp_start_if_needed
+{
+	@req_entry_total = count();
+	@req_entry_ssp[tid] = (uint64)arg0;
+	@req_entry_ts[tid] = nsecs;
+	@req_entry_do_norm[tid] = (uint64)arg2;
+	@req_entry_sync_waiter[tid] = (uint64)arg3;
+
+	$cs = 0;
+	if (@cs_memslot_depth[tid]) {
+		$cs = 2;
+		@req_entry_memslot_tagged = count();
+	} else {
+		if (@cs_ioeventfd_depth[tid]) {
+			$cs = 1;
+			@req_entry_ioeventfd_tagged = count();
+		} else {
+			@req_entry_unknown_callsite = count();
+		}
+	}
+	@req_entry_callsite[tid] = $cs;
+}
+
+kretprobe:srcu_gp_start_if_needed
+/@req_entry_ssp[tid]/
+{
+	$ssp = @req_entry_ssp[tid];
+	$s = (uint64)retval;
+	$ets = @req_entry_ts[tid];
+	$dn = @req_entry_do_norm[tid];
+	$sw = @req_entry_sync_waiter[tid];
+	$cs = @req_entry_callsite[tid];
+
+	@req_ret_total = count();
+
+	// Lock &kvm->srcu by the first GP tagged with KVM callsite.
+	if ($cs != 0 && @kvm_ssp_ready[0] == 0) {
+		@kvm_ssp = (uint64)$ssp;
+		@kvm_ssp_ready[0] = 1;
+	}
+
+	// After locking: all GPs on this ssp (including untagged ones) join normal in-flight tracking.
+	if (@kvm_ssp_ready[0] && (uint64)$ssp == @kvm_ssp) {
+		// Expedited enters while normal GP is still in-flight (checked before this request increments inflight).
+		if ($dn == 0 && $cs != 0 && @kvm_norm_inflight[0] > 0) {
+			@exp_overlap_pending[$ssp, $s] = 1;
+		}
+		@gp_kvm_trk[$ssp, $s] = 1;
+		@gp_dn_kvm[$ssp, $s] = $dn;
+		if ($dn == 1) {
+			@kvm_norm_inflight[0] = @kvm_norm_inflight[0] + 1;
+		}
+	}
+
+	if ($ets) {
+		if ($cs) {
+			/* Multi-request compatible: allow accumulation on the same (ssp,s) key instead of overwrite. */
+			@call_req_cnt[$ssp, $s] = @call_req_cnt[$ssp, $s] + 1;
+			$fts = @call_first_ts[$ssp, $s];
+			if ($fts == 0 || $ets < $fts) {
+				@call_first_ts[$ssp, $s] = $ets;
+			}
+			$lts = @call_last_ts[$ssp, $s];
+			if ($lts == 0 || $ets > $lts) {
+				@call_last_ts[$ssp, $s] = $ets;
+			}
+
+			$dn_set = @call_dn_set[$ssp, $s];
+			if ($dn_set == 0) {
+				@call_dn_set[$ssp, $s] = 1;
+				@call_do_norm[$ssp, $s] = $dn;
+			} else {
+				$dn_old = @call_do_norm[$ssp, $s];
+				if ($dn_old != $dn) {
+					@call_dn_conflict = count();
+					@call_do_norm_mixed[$ssp, $s] = 1;
+				}
+			}
+
+			$sw_set = @call_sw_set[$ssp, $s];
+			if ($sw_set == 0) {
+				@call_sw_set[$ssp, $s] = 1;
+				@call_sync_waiter[$ssp, $s] = $sw;
+			} else {
+				$sw_old = @call_sync_waiter[$ssp, $s];
+				if ($sw_old != $sw) {
+					@call_sw_conflict = count();
+					@call_sync_waiter_mixed[$ssp, $s] = 1;
+				}
+			}
+
+			$cs_set = @call_cs_set[$ssp, $s];
+			if ($cs_set == 0) {
+				@call_cs_set[$ssp, $s] = 1;
+				@call_callsite[$ssp, $s] = $cs;
+			} else {
+				$cs_old = @call_callsite[$ssp, $s];
+				if ($cs_old != $cs) {
+					@call_cs_conflict = count();
+					@call_callsite_mixed[$ssp, $s] = 1;
+				}
+			}
+
+			@target_ssp[$ssp] = 1;
+			if ($cs == 2) {
+				@call_key_memslot = count();
+			} else {
+				if ($cs == 1) {
+					@call_key_ioeventfd = count();
+				}
+			}
+		} else {
+			@call_drop_no_callsite = count();
+		}
+	}
+
+	delete(@req_entry_ssp[tid]);
+	delete(@req_entry_ts[tid]);
+	delete(@req_entry_do_norm[tid]);
+	delete(@req_entry_sync_waiter[tid]);
+	delete(@req_entry_callsite[tid]);
+}
+
+kprobe:srcu_bpf_gp_end*
+{
+	$ssp = (uint64)arg0;
+	$s = (uint64)arg2;
+	@gp_end_seen_total = count();
+
+	$c = @call_req_cnt[$ssp, $s];
+	$st = @call_first_ts[$ssp, $s];
+
+	// kvm->srcu: decrement when normal GP completes; for tagged-overlap expedited GP, record end-to-end wait.
+	if (@kvm_ssp_ready[0] && $ssp == @kvm_ssp && @gp_kvm_trk[$ssp, $s]) {
+		$dnk = @gp_dn_kvm[$ssp, $s];
+		if ($dnk == 1) {
+			@kvm_norm_inflight[0] = @kvm_norm_inflight[0] - 1;
+		}
+		if (@exp_overlap_pending[$ssp, $s]) {
+			if ($st) {
+				$dur_ov = nsecs - $st;
+				@kvm_exp_wait_after_norm_inflight_us = hist($dur_ov / 1000);
+				@kvm_exp_overlap_cnt = count();
+			}
+			delete(@exp_overlap_pending[$ssp, $s]);
+		}
+		delete(@gp_kvm_trk[$ssp, $s]);
+		delete(@gp_dn_kvm[$ssp, $s]);
+	}
+
+	if ($c && $st) {
+		$dur_first = nsecs - $st;
+		$dur_last = nsecs - @call_last_ts[$ssp, $s];
+		@call_gp_keys = count();
+		@call_req_per_key = hist($c);
+		@call_main_cnt = @call_main_cnt + $c;
+		/* Keep first-entry->gp_end duration histogram for backward-compatible charts. */
+		@call_dur_us = hist($dur_first / 1000);
+		/* Add lower-bound histogram: last request -> gp_end. */
+		@call_dur_last_us = hist($dur_last / 1000);
+
+		$dn = @call_do_norm[$ssp, $s];
+		if (@call_do_norm_mixed[$ssp, $s]) {
+			@call_dn_conflict_keys_seen = count();
+			@call_dn_conflict_reqs = @call_dn_conflict_reqs + $c;
+		}
+		if ($dn == 0) {
+			@call_exp_cnt = @call_exp_cnt + $c;
+		} else {
+			if ($dn == 1) {
+				@call_nonexp_cnt = @call_nonexp_cnt + $c;
+			} else {
+				@call_unknown_do_norm = @call_unknown_do_norm + $c;
+			}
+		}
+
+		$cs = @call_callsite[$ssp, $s];
+		if (@call_callsite_mixed[$ssp, $s]) {
+			@call_cs_conflict_keys_seen = count();
+			@call_cs_conflict_reqs = @call_cs_conflict_reqs + $c;
+		}
+		if ($cs == 2) {
+			@call_memslot_cnt = @call_memslot_cnt + $c;
+			@call_memslot_dur_us = hist($dur_first / 1000);
+			if ($dn == 0) {
+				@call_memslot_exp_cnt = @call_memslot_exp_cnt + $c;
+			} else {
+				if ($dn == 1) {
+					@call_memslot_nonexp_cnt = @call_memslot_nonexp_cnt + $c;
+				}
+			}
+		} else {
+			if ($cs == 1) {
+				@call_ioeventfd_cnt = @call_ioeventfd_cnt + $c;
+				@call_ioeventfd_dur_us = hist($dur_first / 1000);
+				if ($dn == 0) {
+					@call_ioeventfd_exp_cnt = @call_ioeventfd_exp_cnt + $c;
+				} else {
+					if ($dn == 1) {
+						@call_ioeventfd_nonexp_cnt = @call_ioeventfd_nonexp_cnt + $c;
+					}
+				}
+			} else {
+				@call_unknown_callsite_cnt = @call_unknown_callsite_cnt + $c;
+			}
+		}
+
+		if (@call_sync_waiter_mixed[$ssp, $s]) {
+			@call_sync_waiter_mixed_cnt = @call_sync_waiter_mixed_cnt + $c;
+		}
+		if (@call_sync_waiter[$ssp, $s] == 1) {
+			@call_sync_waiter_cnt = @call_sync_waiter_cnt + $c;
+			@call_sync_waiter_dur_us = hist($dur_first / 1000);
+		} else {
+			@call_async_cnt = @call_async_cnt + $c;
+		}
+
+		delete(@call_req_cnt[$ssp, $s]);
+		delete(@call_first_ts[$ssp, $s]);
+		delete(@call_last_ts[$ssp, $s]);
+		delete(@call_dn_set[$ssp, $s]);
+		delete(@call_sw_set[$ssp, $s]);
+		delete(@call_cs_set[$ssp, $s]);
+		delete(@call_do_norm[$ssp, $s]);
+		delete(@call_sync_waiter[$ssp, $s]);
+		delete(@call_callsite[$ssp, $s]);
+		delete(@call_do_norm_mixed[$ssp, $s]);
+		delete(@call_sync_waiter_mixed[$ssp, $s]);
+		delete(@call_callsite_mixed[$ssp, $s]);
+	} else {
+		@gp_end_without_call_start = count();
+	}
+}
+
+END
+{
+	print(@gp_end_seen_total);
+	print(@gp_end_without_call_start);
+
+	print(@call_main_cnt);
+	print(@call_exp_cnt);
+	print(@call_nonexp_cnt);
+	print(@call_unknown_do_norm);
+
+	print(@call_memslot_cnt);
+	print(@call_ioeventfd_cnt);
+	print(@call_unknown_callsite_cnt);
+
+	print(@call_memslot_exp_cnt);
+	print(@call_memslot_nonexp_cnt);
+	print(@call_ioeventfd_exp_cnt);
+	print(@call_ioeventfd_nonexp_cnt);
+
+	print(@call_sync_waiter_cnt);
+	print(@call_async_cnt);
+	print(@call_drop_no_callsite);
+
+	print(@cs_memslot_hit);
+	print(@cs_ioeventfd_hit);
+	print(@req_entry_total);
+	print(@req_ret_total);
+	print(@req_entry_unknown_callsite);
+	print(@req_entry_memslot_tagged);
+	print(@req_entry_ioeventfd_tagged);
+
+	print(@reader_target_cnt);
+	print(@call_dur_us);
+	print(@call_dur_last_us);
+	print(@call_memslot_dur_us);
+	print(@call_ioeventfd_dur_us);
+	print(@call_sync_waiter_dur_us);
+	print(@reader_target_dur_us);
+	print(@call_gp_keys);
+	print(@call_req_per_key);
+	print(@call_dn_conflict);
+	print(@call_cs_conflict);
+	print(@call_sw_conflict);
+	print(@call_sync_waiter_mixed_cnt);
+
+	printf("\n--- kvm->srcu only ---\n");
+	print(@kvm_ssp_ready);
+	print(@kvm_kvm_reader_cnt);
+	print(@kvm_reader_ge_1ms);
+	print(@kvm_reader_ge_4ms);
+	print(@kvm_reader_dur_us);
+	print(@kvm_norm_inflight);
+	print(@kvm_exp_overlap_cnt);
+	print(@kvm_exp_wait_after_norm_inflight_us);
+}
