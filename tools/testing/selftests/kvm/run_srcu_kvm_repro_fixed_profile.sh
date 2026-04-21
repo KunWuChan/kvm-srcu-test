@@ -9,8 +9,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BT_SCRIPT="${SCRIPT_DIR}/srcu-kvm-bpftrace-callsite.bt"
 BIN="${SCRIPT_DIR}/srcu_kvm_fixed_profile_test"
+NX_LOAD_SCRIPT="${SCRIPT_DIR}/x86/nx_huge_pages_test.sh"
 storm_arg="${1:-}"
 post_run_settle_s="${POST_RUN_SETTLE_S:-45}"
+nx_load="${NX_LOAD:-0}"
 
 case "${storm_arg}" in
 	0|off|nostorm) storm=0 ;;
@@ -38,6 +40,11 @@ BT_OUT="${OUT_DIR}/bpftrace.out"
 TEST_OUT="${OUT_DIR}/selftest.stdout"
 
 cleanup() {
+	if [[ -n "${NX_LOAD_PID:-}" ]] && kill -0 "${NX_LOAD_PID}" 2>/dev/null; then
+		NX_STOP=1
+		kill -TERM "${NX_LOAD_PID}" 2>/dev/null || true
+		wait "${NX_LOAD_PID}" 2>/dev/null || true
+	fi
 	if [[ -n "${BT_PID:-}" ]] && kill -0 "${BT_PID}" 2>/dev/null; then
 		kill -INT "${BT_PID}" 2>/dev/null || true
 		wait "${BT_PID}" 2>/dev/null || true
@@ -47,6 +54,7 @@ trap cleanup EXIT
 
 echo "[info] output_dir=${OUT_DIR}"
 echo "[info] storm=${storm}"
+echo "[info] nx_load=${nx_load}"
 
 echo "[info] starting bpftrace..."
 if [[ "${EUID}" -eq 0 ]]; then
@@ -67,6 +75,21 @@ for _i in $(seq 1 30); do
 	fi
 	sleep 0.2
 done
+
+if [[ "${nx_load}" == "1" ]]; then
+	if [[ ! -x "${NX_LOAD_SCRIPT}" ]]; then
+		echo "[error] nx load script not found or not executable: ${NX_LOAD_SCRIPT}"
+		exit 2
+	fi
+	NX_STOP=0
+	(
+		while [[ "${NX_STOP}" == "0" ]]; do
+			bash "${NX_LOAD_SCRIPT}" >/dev/null 2>&1 || true
+		done
+	) &
+	NX_LOAD_PID=$!
+	echo "[info] nx load worker started: pid=${NX_LOAD_PID}"
+fi
 
 echo "[info] running fixed profile selftest..."
 "${BIN}" "${storm}" | tee "${TEST_OUT}"
@@ -101,8 +124,10 @@ call_memslot_cnt="$(get_bt_counter "@call_memslot_cnt")"
 call_ioeventfd_cnt="$(get_bt_counter "@call_ioeventfd_cnt")"
 kvm_reader_ge_1ms="$(get_bt_counter "@kvm_reader_ge_1ms")"
 kvm_reader_ge_4ms="$(get_bt_counter "@kvm_reader_ge_4ms")"
+nx_recover_hit="$(get_bt_counter "@nx_recover_hit")"
+ge1_in_nx_recover="$(get_bt_counter "@ge1_in_nx_recover")"
 
-for vname in gp_end_seen_total call_main_cnt call_memslot_cnt call_ioeventfd_cnt kvm_reader_ge_1ms kvm_reader_ge_4ms; do
+for vname in gp_end_seen_total call_main_cnt call_memslot_cnt call_ioeventfd_cnt kvm_reader_ge_1ms kvm_reader_ge_4ms nx_recover_hit ge1_in_nx_recover; do
 	v="${!vname}"
 	if [[ -z "${v}" ]]; then
 		v=0
@@ -125,4 +150,4 @@ fi
 echo "[ok] done"
 echo "[ok] selftest output: ${TEST_OUT}"
 echo "[ok] bpftrace output: ${BT_OUT}"
-echo "[ok] counters: gp_end=${gp_end_seen_total} call_main=${call_main_cnt} memslot=${call_memslot_cnt} ioeventfd=${call_ioeventfd_cnt} reader_ge_1ms=${kvm_reader_ge_1ms} reader_ge_4ms=${kvm_reader_ge_4ms}"
+echo "[ok] counters: gp_end=${gp_end_seen_total} call_main=${call_main_cnt} memslot=${call_memslot_cnt} ioeventfd=${call_ioeventfd_cnt} reader_ge_1ms=${kvm_reader_ge_1ms} reader_ge_4ms=${kvm_reader_ge_4ms} nx_recover_hit=${nx_recover_hit} ge1_in_nx_recover=${ge1_in_nx_recover}"
