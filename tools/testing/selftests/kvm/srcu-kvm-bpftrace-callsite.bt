@@ -59,10 +59,105 @@ kretprobe:kvm_io_bus_register_dev
 	}
 }
 
+/*
+ * kvm_handle_hva_range() is static __always_inline on some kernels,
+ * so tag the nearest callable MMU-notifier wrappers instead.
+ */
+kprobe:kvm_mmu_notifier_invalidate_range_start
+{
+	@hva_range_depth[tid] = @hva_range_depth[tid] + 1;
+	if (@hva_range_depth[tid] == 1) {
+		@hva_range_fn_start[tid] = nsecs;
+	}
+	@hva_range_hit = count();
+}
+
+kretprobe:kvm_mmu_notifier_invalidate_range_start
+/@hva_range_depth[tid]/
+{
+	$st = @hva_range_fn_start[tid];
+	if ($st) {
+		@hva_range_fn_dur_us = hist((nsecs - $st) / 1000);
+		delete(@hva_range_fn_start[tid]);
+	}
+	@hva_range_depth[tid] = @hva_range_depth[tid] - 1;
+	if (@hva_range_depth[tid] == 0) {
+		delete(@hva_range_depth[tid]);
+	}
+}
+
+kprobe:kvm_mmu_notifier_invalidate_range_end
+{
+	@hva_range_depth[tid] = @hva_range_depth[tid] + 1;
+	if (@hva_range_depth[tid] == 1) {
+		@hva_range_fn_start[tid] = nsecs;
+	}
+	@hva_range_hit = count();
+}
+
+kretprobe:kvm_mmu_notifier_invalidate_range_end
+/@hva_range_depth[tid]/
+{
+	$st = @hva_range_fn_start[tid];
+	if ($st) {
+		@hva_range_fn_dur_us = hist((nsecs - $st) / 1000);
+		delete(@hva_range_fn_start[tid]);
+	}
+	@hva_range_depth[tid] = @hva_range_depth[tid] - 1;
+	if (@hva_range_depth[tid] == 0) {
+		delete(@hva_range_depth[tid]);
+	}
+}
+
+kprobe:kvm_recover_nx_huge_pages
+{
+	@nx_recover_depth[tid] = @nx_recover_depth[tid] + 1;
+	@nx_recover_fn_start[tid] = nsecs;
+	@nx_recover_hit = count();
+}
+
+kretprobe:kvm_recover_nx_huge_pages
+/@nx_recover_depth[tid]/
+{
+	$st = @nx_recover_fn_start[tid];
+	if ($st) {
+		@nx_recover_fn_dur_us = hist((nsecs - $st) / 1000);
+		delete(@nx_recover_fn_start[tid]);
+	}
+	@nx_recover_depth[tid] = @nx_recover_depth[tid] - 1;
+	if (@nx_recover_depth[tid] == 0) {
+		delete(@nx_recover_depth[tid]);
+	}
+}
+
+kprobe:kvm_arch_vcpu_ioctl_run
+{
+	@vcpu_run_depth[tid] = @vcpu_run_depth[tid] + 1;
+	if (@vcpu_run_depth[tid] == 1) {
+		@vcpu_run_fn_start[tid] = nsecs;
+	}
+	@vcpu_run_hit = count();
+}
+
+kretprobe:kvm_arch_vcpu_ioctl_run
+/@vcpu_run_depth[tid]/
+{
+	$st = @vcpu_run_fn_start[tid];
+	if ($st) {
+		@vcpu_run_fn_dur_us = hist((nsecs - $st) / 1000);
+		delete(@vcpu_run_fn_start[tid]);
+	}
+	@vcpu_run_depth[tid] = @vcpu_run_depth[tid] - 1;
+	if (@vcpu_run_depth[tid] == 0) {
+		delete(@vcpu_run_depth[tid]);
+	}
+}
+
 kprobe:srcu_bpf_reader_lock
 {
 	@reader_ssp[tid, (uint64)arg1, (uint64)arg2] = (uint64)arg0;
 	@reader_start[tid, (uint64)arg1, (uint64)arg2] = nsecs;
+	@reader_lock_kstack[tid, (uint64)arg1, (uint64)arg2] = kstack;
 }
 
 kprobe:srcu_bpf_reader_unlock
@@ -73,6 +168,7 @@ kprobe:srcu_bpf_reader_unlock
 	if ($start) {
 		$dur = nsecs - $start;
 		$ssp = @reader_ssp[tid, $k1, $k2];
+		$lks = @reader_lock_kstack[tid, $k1, $k2];
 		@reader_total = count();
 		@reader_dur_us = hist($dur / 1000);
 		if (@target_ssp[$ssp]) {
@@ -85,6 +181,47 @@ kprobe:srcu_bpf_reader_unlock
 			@kvm_reader_dur_us = hist($dur / 1000);
 			if ($dur / 1000 >= 1000) {
 				@kvm_reader_ge_1ms = count();
+				@kvm_reader_ge_1ms_lock_kstack[$lks] = count();
+				@kvm_reader_ge_1ms_unlock_kstack[kstack] = count();
+				if (@hva_range_depth[tid]) {
+					@ge1_in_hva_range = count();
+				}
+				if (@nx_recover_depth[tid]) {
+					@ge1_in_nx_recover = count();
+				}
+				if (@vcpu_run_depth[tid]) {
+					@ge1_in_vcpu_run = count();
+				}
+			}
+			if (@hva_range_depth[tid]) {
+				@kvm_reader_cnt_in_hva_range = count();
+				@kvm_reader_dur_us_in_hva_range = hist($dur / 1000);
+				if ($dur / 1000 >= 100) {
+					@kvm_reader_ge_100us_in_hva_range = count();
+				}
+				if ($dur / 1000 >= 500) {
+					@kvm_reader_ge_500us_in_hva_range = count();
+				}
+			}
+			if (@nx_recover_depth[tid]) {
+				@kvm_reader_cnt_in_nx_recover = count();
+				@kvm_reader_dur_us_in_nx_recover = hist($dur / 1000);
+				if ($dur / 1000 >= 100) {
+					@kvm_reader_ge_100us_in_nx_recover = count();
+				}
+				if ($dur / 1000 >= 500) {
+					@kvm_reader_ge_500us_in_nx_recover = count();
+				}
+			}
+			if (@vcpu_run_depth[tid]) {
+				@kvm_reader_cnt_in_vcpu_run = count();
+				@kvm_reader_dur_us_in_vcpu_run = hist($dur / 1000);
+				if ($dur / 1000 >= 100) {
+					@kvm_reader_ge_100us_in_vcpu_run = count();
+				}
+				if ($dur / 1000 >= 500) {
+					@kvm_reader_ge_500us_in_vcpu_run = count();
+				}
 			}
 			if ($dur / 1000 >= 4000) {
 				@kvm_reader_ge_4ms = count();
@@ -92,6 +229,7 @@ kprobe:srcu_bpf_reader_unlock
 		}
 		delete(@reader_start[tid, $k1, $k2]);
 		delete(@reader_ssp[tid, $k1, $k2]);
+		delete(@reader_lock_kstack[tid, $k1, $k2]);
 	}
 }
 
@@ -354,6 +492,9 @@ END
 
 	print(@cs_memslot_hit);
 	print(@cs_ioeventfd_hit);
+	print(@hva_range_hit);
+	print(@nx_recover_hit);
+	print(@vcpu_run_hit);
 	print(@req_entry_total);
 	print(@req_ret_total);
 	print(@req_entry_unknown_callsite);
@@ -378,7 +519,27 @@ END
 	print(@kvm_ssp_ready);
 	print(@kvm_kvm_reader_cnt);
 	print(@kvm_reader_ge_1ms);
+	print(@ge1_in_hva_range);
+	print(@ge1_in_nx_recover);
+	print(@ge1_in_vcpu_run);
+	print(@kvm_reader_cnt_in_hva_range);
+	print(@kvm_reader_ge_100us_in_hva_range);
+	print(@kvm_reader_ge_500us_in_hva_range);
+	print(@kvm_reader_cnt_in_nx_recover);
+	print(@kvm_reader_ge_100us_in_nx_recover);
+	print(@kvm_reader_ge_500us_in_nx_recover);
+	print(@kvm_reader_cnt_in_vcpu_run);
+	print(@kvm_reader_ge_100us_in_vcpu_run);
+	print(@kvm_reader_ge_500us_in_vcpu_run);
 	print(@kvm_reader_ge_4ms);
+	print(@kvm_reader_dur_us_in_hva_range);
+	print(@kvm_reader_dur_us_in_nx_recover);
+	print(@kvm_reader_dur_us_in_vcpu_run);
+	print(@kvm_reader_ge_1ms_lock_kstack);
+	print(@kvm_reader_ge_1ms_unlock_kstack);
+	print(@hva_range_fn_dur_us);
+	print(@nx_recover_fn_dur_us);
+	print(@vcpu_run_fn_dur_us);
 	print(@kvm_reader_dur_us);
 	print(@kvm_norm_inflight);
 	print(@kvm_exp_overlap_cnt);
