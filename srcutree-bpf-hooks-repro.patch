@@ -1,0 +1,289 @@
+From 4bc64e98ef707766ac2a83955cd8f9e0c9fecd12 Mon Sep 17 00:00:00 2001
+From: Kunwu Chan <kunwu.chan@linux.dev>
+Date: Mon, 13 Apr 2026 09:43:57 +0800
+Subject: [PATCH] kvm/debug: 0412 test
+
+[base-commit: 09c0f7f1bcdb (origin/master, origin/HEAD, master) Add linux-next specific files for 20260323 ]
+Signed-off-by: Kunwu Chan <kunwu.chan@linux.dev>
+---
+ kernel/rcu/srcutree.c | 153 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 140 insertions(+), 13 deletions(-)
+
+diff --git a/kernel/rcu/srcutree.c b/kernel/rcu/srcutree.c
+index aef8e91ad33e..1999283a28c6 100644
+--- a/kernel/rcu/srcutree.c
++++ b/kernel/rcu/srcutree.c
+@@ -68,6 +68,7 @@ module_param(big_cpu_lim, int, 0444);
+ static int small_contention_lim __read_mostly = 100;
+ module_param(small_contention_lim, int, 0444);
+ 
++
+ /* Early-boot callback-management, so early that no lock is required! */
+ static LIST_HEAD(srcu_boot_list);
+ static bool __read_mostly srcu_init_done;
+@@ -76,6 +77,101 @@ static void srcu_invoke_callbacks(struct work_struct *work);
+ static void srcu_reschedule(struct srcu_struct *ssp, unsigned long delay);
+ static void process_srcu(struct work_struct *work);
+ static void srcu_delay_timer(struct timer_list *t);
++void srcu_bpf_waiter_entry(struct srcu_struct *ssp, struct srcu_usage *sup,
++			   struct rcu_head *rhp, bool do_norm);
++void srcu_bpf_waiter_snap(struct srcu_struct *ssp, struct srcu_usage *sup,
++			  struct rcu_head *rhp, unsigned long s, bool do_norm);
++void srcu_bpf_gp_start(struct srcu_struct *ssp, struct srcu_usage *sup,
++		       unsigned long s);
++void srcu_bpf_gp_end(struct srcu_struct *ssp, struct srcu_usage *sup,
++		     unsigned long s);
++void srcu_bpf_reader_lock(struct srcu_struct *ssp, struct srcu_usage *sup, int idx);
++void srcu_bpf_reader_unlock(struct srcu_struct *ssp, struct srcu_usage *sup, int idx);
++
++/*
++ * eBPF instrumentation hooks.
++ *
++ * These helpers do not implement logic. They only provide stable trace hooks
++ * for bpftrace/kprobe/fentry while keeping SRCU timing behavior unchanged:
++ * 1) waiter window entry: srcu_gp_start_if_needed() entry (sync/wakeme path only)
++ * 2) waiter pairing key s: right after rcu_seq_snap() (same GP identity semantics)
++ * 3) gp_start event: after rcu_seq_start() in srcu_gp_start()
++ * 4) gp_end event: before mutex_unlock(&srcu_cb_mutex) in srcu_gp_end()
++ * 5) reader critical-section window: kvm->srcu srcu_read_lock/unlock path
++ *
++ * Important: helpers must explicitly "use" all parameters to prevent compiler
++ * .constprop/.isra cloning of empty functions, which can break kprobe ABI
++ * assumptions and cause incorrect reads of waiter s / sup / rhp.
++ */
++void noinline srcu_bpf_waiter_entry(struct srcu_struct *ssp,
++					    struct srcu_usage *sup,
++					    struct rcu_head *rhp,
++					    bool do_norm)
++{
++	barrier_data(ssp);
++	barrier_data(sup);
++	barrier_data(rhp);
++	OPTIMIZER_HIDE_VAR(do_norm);
++	barrier();
++}
++EXPORT_SYMBOL_GPL(srcu_bpf_waiter_entry);
++
++void noinline srcu_bpf_waiter_snap(struct srcu_struct *ssp,
++					  struct srcu_usage *sup,
++					  struct rcu_head *rhp,
++					  unsigned long s,
++					  bool do_norm)
++{
++	barrier_data(ssp);
++	barrier_data(sup);
++	barrier_data(rhp);
++	OPTIMIZER_HIDE_VAR(s);
++	OPTIMIZER_HIDE_VAR(do_norm);
++	barrier();
++}
++EXPORT_SYMBOL_GPL(srcu_bpf_waiter_snap);
++
++void noinline srcu_bpf_gp_start(struct srcu_struct *ssp,
++					struct srcu_usage *sup,
++					unsigned long s)
++{
++	barrier_data(ssp);
++	barrier_data(sup);
++	OPTIMIZER_HIDE_VAR(s);
++	barrier();
++}
++EXPORT_SYMBOL_GPL(srcu_bpf_gp_start);
++
++void noinline srcu_bpf_gp_end(struct srcu_struct *ssp,
++				      struct srcu_usage *sup,
++				      unsigned long s)
++{
++	barrier_data(ssp);
++	barrier_data(sup);
++	OPTIMIZER_HIDE_VAR(s);
++	barrier();
++}
++EXPORT_SYMBOL_GPL(srcu_bpf_gp_end);
++
++void noinline srcu_bpf_reader_lock(struct srcu_struct *ssp,
++					   struct srcu_usage *sup, int idx)
++{
++	barrier_data(ssp);
++	barrier_data(sup);
++	OPTIMIZER_HIDE_VAR(idx);
++	barrier();
++}
++EXPORT_SYMBOL_GPL(srcu_bpf_reader_lock);
++
++void noinline srcu_bpf_reader_unlock(struct srcu_struct *ssp,
++					     struct srcu_usage *sup, int idx)
++{
++	barrier_data(ssp);
++	barrier_data(sup);
++	OPTIMIZER_HIDE_VAR(idx);
++	barrier();
++}
++EXPORT_SYMBOL_GPL(srcu_bpf_reader_unlock);
+ 
+ /* Wrappers for lock acquisition and release, see raw_spin_lock_rcu_node(). */
+ #define spin_lock_rcu_node(p)							\
+@@ -818,10 +914,14 @@ EXPORT_SYMBOL_GPL(__srcu_check_read_flavor);
+ int __srcu_read_lock(struct srcu_struct *ssp)
+ {
+ 	struct srcu_ctr __percpu *scp = READ_ONCE(ssp->srcu_ctrp);
++	struct srcu_usage *sup = ssp->srcu_sup;
++	int idx;
+ 
+ 	this_cpu_inc(scp->srcu_locks.counter);
+ 	smp_mb(); /* B */  /* Avoid leaking the critical section. */
+-	return __srcu_ptr_to_ctr(ssp, scp);
++	idx = __srcu_ptr_to_ctr(ssp, scp);
++	srcu_bpf_reader_lock(ssp, sup, idx);
++	return idx;
+ }
+ EXPORT_SYMBOL_GPL(__srcu_read_lock);
+ 
+@@ -832,6 +932,7 @@ EXPORT_SYMBOL_GPL(__srcu_read_lock);
+  */
+ void __srcu_read_unlock(struct srcu_struct *ssp, int idx)
+ {
++	srcu_bpf_reader_unlock(ssp, ssp->srcu_sup, idx);
+ 	smp_mb(); /* C */  /* Avoid leaking the critical section. */
+ 	this_cpu_inc(__srcu_ctr_to_ptr(ssp, idx)->srcu_unlocks.counter);
+ }
+@@ -847,11 +948,15 @@ EXPORT_SYMBOL_GPL(__srcu_read_unlock);
+ int __srcu_read_lock_nmisafe(struct srcu_struct *ssp)
+ {
+ 	struct srcu_ctr __percpu *scpp = READ_ONCE(ssp->srcu_ctrp);
++	struct srcu_usage *sup = ssp->srcu_sup;
+ 	struct srcu_ctr *scp = raw_cpu_ptr(scpp);
++	int idx;
+ 
+ 	atomic_long_inc(&scp->srcu_locks);
+ 	smp_mb__after_atomic(); /* B */  /* Avoid leaking the critical section. */
+-	return __srcu_ptr_to_ctr(ssp, scpp);
++	idx = __srcu_ptr_to_ctr(ssp, scpp);
++	srcu_bpf_reader_lock(ssp, sup, idx);
++	return idx;
+ }
+ EXPORT_SYMBOL_GPL(__srcu_read_lock_nmisafe);
+ 
+@@ -862,6 +967,7 @@ EXPORT_SYMBOL_GPL(__srcu_read_lock_nmisafe);
+  */
+ void __srcu_read_unlock_nmisafe(struct srcu_struct *ssp, int idx)
+ {
++	srcu_bpf_reader_unlock(ssp, ssp->srcu_sup, idx);
+ 	smp_mb__before_atomic(); /* C */  /* Avoid leaking the critical section. */
+ 	atomic_long_inc(&raw_cpu_ptr(__srcu_ctr_to_ptr(ssp, idx))->srcu_unlocks);
+ }
+@@ -875,14 +981,22 @@ EXPORT_SYMBOL_GPL(__srcu_read_unlock_nmisafe);
+ static void srcu_gp_start(struct srcu_struct *ssp)
+ {
+ 	int state;
++	unsigned long gpseq;
++	struct srcu_usage *sup = ssp->srcu_sup;
+ 
+-	lockdep_assert_held(&ACCESS_PRIVATE(ssp->srcu_sup, lock));
+-	WARN_ON_ONCE(ULONG_CMP_GE(ssp->srcu_sup->srcu_gp_seq, ssp->srcu_sup->srcu_gp_seq_needed));
+-	WRITE_ONCE(ssp->srcu_sup->srcu_gp_start, jiffies);
+-	WRITE_ONCE(ssp->srcu_sup->srcu_n_exp_nodelay, 0);
++	lockdep_assert_held(&ACCESS_PRIVATE(sup, lock));
++	WARN_ON_ONCE(ULONG_CMP_GE(sup->srcu_gp_seq, sup->srcu_gp_seq_needed));
++	WRITE_ONCE(sup->srcu_gp_start, jiffies);
++	WRITE_ONCE(sup->srcu_n_exp_nodelay, 0);
+ 	smp_mb(); /* Order prior store to ->srcu_gp_seq_needed vs. GP start. */
+-	rcu_seq_start(&ssp->srcu_sup->srcu_gp_seq);
+-	state = rcu_seq_state(ssp->srcu_sup->srcu_gp_seq);
++	rcu_seq_start(&sup->srcu_gp_seq);
++	/*
++	 * Export the "post-completion" GP sequence value, not the scan1 current value.
++	 * This lets bpf side pair gp_start and gp_end directly by the same (sup, s).
++	 */
++	gpseq = rcu_seq_endval(&sup->srcu_gp_seq);
++	srcu_bpf_gp_start(ssp, sup, gpseq);
++	state = rcu_seq_state(sup->srcu_gp_seq);
+ 	WARN_ON_ONCE(state != SRCU_STATE_SCAN1);
+ }
+ 
+@@ -1017,6 +1131,7 @@ static void srcu_gp_end(struct srcu_struct *ssp)
+ 		}
+ 
+ 	/* Callback initiation done, allow grace periods after next. */
++	srcu_bpf_gp_end(ssp, sup, gpseq);
+ 	mutex_unlock(&sup->srcu_cb_mutex);
+ 
+ 	/* Start a new grace period if needed. */
+@@ -1069,8 +1184,9 @@ static void srcu_funnel_exp_start(struct srcu_struct *ssp, struct srcu_node *snp
+ 			spin_unlock_irqrestore_rcu_node(snp, flags);
+ 		}
+ 	spin_lock_irqsave_ssp_contention(ssp, &flags);
+-	if (ULONG_CMP_LT(ssp->srcu_sup->srcu_gp_seq_needed_exp, s))
++	if (ULONG_CMP_LT(ssp->srcu_sup->srcu_gp_seq_needed_exp, s)) {
+ 		WRITE_ONCE(ssp->srcu_sup->srcu_gp_seq_needed_exp, s);
++	}
+ 	spin_unlock_irqrestore_rcu_node(ssp->srcu_sup, flags);
+ }
+ 
+@@ -1154,9 +1270,10 @@ static void srcu_funnel_gp_start(struct srcu_struct *ssp, struct srcu_data *sdp,
+ 		// it isn't.  And it does not have to be.  After all, it
+ 		// can only be executed during early boot when there is only
+ 		// the one boot CPU running with interrupts still disabled.
+-		if (likely(srcu_init_done))
++		if (likely(srcu_init_done)) {
+ 			queue_delayed_work(rcu_gp_wq, &sup->work,
+ 					   !!srcu_get_delay(ssp));
++		}
+ 		else if (list_empty(&sup->work.work.entry))
+ 			list_add(&sup->work.work.entry, &srcu_boot_list);
+ 	}
+@@ -1327,7 +1444,8 @@ static void srcu_leak_callback(struct rcu_head *rhp)
+  * Start an SRCU grace period, and also queue the callback if non-NULL.
+  */
+ static unsigned long srcu_gp_start_if_needed(struct srcu_struct *ssp,
+-					     struct rcu_head *rhp, bool do_norm)
++					     struct rcu_head *rhp, bool do_norm,
++					     bool sync_waiter)
+ {
+ 	unsigned long flags;
+ 	int idx;
+@@ -1339,6 +1457,12 @@ static unsigned long srcu_gp_start_if_needed(struct srcu_struct *ssp,
+ 	int ss_state;
+ 
+ 	check_init_srcu_struct(ssp);
++	/*
++	 * Waiter-window entry marker at srcu_gp_start_if_needed(), only for the
++	 * __call_srcu(..., wakeme_after_rcu, ...) sync_waiter path.
++	 */
++	if (sync_waiter)
++		srcu_bpf_waiter_entry(ssp, ssp->srcu_sup, rhp, do_norm);
+ 	/*
+ 	 * While starting a new grace period, make sure we are in an
+ 	 * SRCU read-side critical section so that the grace-period
+@@ -1390,6 +1514,9 @@ static unsigned long srcu_gp_start_if_needed(struct srcu_struct *ssp,
+ 	 *     period (gp_num = X + 8). So acceleration fails.
+ 	 */
+ 	s = rcu_seq_snap(&ssp->srcu_sup->srcu_gp_seq);
++	/* GP identity key for pairing with srcu_gp_end (same s semantics). */
++	if (sync_waiter)
++		srcu_bpf_waiter_snap(ssp, ssp->srcu_sup, rhp, s, do_norm);
+ 	if (rhp) {
+ 		rcu_segcblist_advance(&sdp->srcu_cblist,
+ 				      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
+@@ -1464,7 +1591,7 @@ static void __call_srcu(struct srcu_struct *ssp, struct rcu_head *rhp,
+ 		return;
+ 	}
+ 	rhp->func = func;
+-	(void)srcu_gp_start_if_needed(ssp, rhp, do_norm);
++	srcu_gp_start_if_needed(ssp, rhp, do_norm, func == wakeme_after_rcu);
+ }
+ 
+ /**
+@@ -1635,7 +1762,7 @@ EXPORT_SYMBOL_GPL(get_state_synchronize_srcu);
+  */
+ unsigned long start_poll_synchronize_srcu(struct srcu_struct *ssp)
+ {
+-	return srcu_gp_start_if_needed(ssp, NULL, true);
++	return srcu_gp_start_if_needed(ssp, NULL, true, false);
+ }
+ EXPORT_SYMBOL_GPL(start_poll_synchronize_srcu);
+ 
+
+base-commit: 1f9955cf856446ded3c4f2f70a5ecae60a3acf7e
+-- 
+2.25.1
