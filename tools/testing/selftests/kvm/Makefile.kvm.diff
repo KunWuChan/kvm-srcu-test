@@ -6,7 +6,7 @@ index 38c1dd752075..c3c1b437089e 100644
  TEST_GEN_PROGS_COMMON += set_memory_region_test
  TEST_GEN_PROGS_COMMON += srcu_kvm_repro_test
  TEST_GEN_PROGS_COMMON += srcu_kvm_repro_delay_split_test
-+TEST_GEN_PROGS_COMMON += srcu_kvm_fixed_profile_test
- TEST_GEN_PROGS_COMMON += srcu_kvm_extreme_stress_test
++TEST_GEN_PROGS_COMMON += srcu_fixed_profile_storm_test
++TEST_GEN_PROGS_COMMON += srcu_fixed_profile_preempt_test
  
  # Compiled test targets
