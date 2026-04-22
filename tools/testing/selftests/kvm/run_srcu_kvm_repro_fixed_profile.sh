@@ -118,16 +118,46 @@ get_bt_counter() {
 	' "${BT_OUT}"
 }
 
+print_bt_top_count_map() {
+	local key="$1"
+	local topn="$2"
+	local title="$3"
+
+	awk -v key="$key" '
+	{
+		pat = "^" key "\\[([^]]+)\\]:[[:space:]]*([0-9]+)$";
+		if (match($0, pat, m)) {
+			printf "%s %s\n", m[2], m[1];
+		}
+	}
+	' "${BT_OUT}" | sort -rn | awk -v n="${topn}" -v title="${title}" '
+	BEGIN { c = 0; printed = 0; }
+	{
+		if (c == 0) {
+			printf "[info] %s\n", title;
+		}
+		c++;
+		printf "[info]   #%d key=%s count=%s\n", c, $2, $1;
+		if (c >= n) {
+			exit;
+		}
+	}
+	END {
+		if (c == 0) {
+			printf "[info] %s: none\n", title;
+		}
+	}
+	'
+}
+
 gp_end_seen_total="$(get_bt_counter "@gp_end_seen_total")"
 call_main_cnt="$(get_bt_counter "@call_main_cnt")"
 call_memslot_cnt="$(get_bt_counter "@call_memslot_cnt")"
 call_ioeventfd_cnt="$(get_bt_counter "@call_ioeventfd_cnt")"
 kvm_reader_ge_1ms="$(get_bt_counter "@kvm_reader_ge_1ms")"
 kvm_reader_ge_4ms="$(get_bt_counter "@kvm_reader_ge_4ms")"
-nx_recover_hit="$(get_bt_counter "@nx_recover_hit")"
-ge1_in_nx_recover="$(get_bt_counter "@ge1_in_nx_recover")"
 
-for vname in gp_end_seen_total call_main_cnt call_memslot_cnt call_ioeventfd_cnt kvm_reader_ge_1ms kvm_reader_ge_4ms nx_recover_hit ge1_in_nx_recover; do
+for vname in gp_end_seen_total call_main_cnt call_memslot_cnt call_ioeventfd_cnt kvm_reader_ge_1ms kvm_reader_ge_4ms; do
 	v="${!vname}"
 	if [[ -z "${v}" ]]; then
 		v=0
@@ -150,4 +180,9 @@ fi
 echo "[ok] done"
 echo "[ok] selftest output: ${TEST_OUT}"
 echo "[ok] bpftrace output: ${BT_OUT}"
-echo "[ok] counters: gp_end=${gp_end_seen_total} call_main=${call_main_cnt} memslot=${call_memslot_cnt} ioeventfd=${call_ioeventfd_cnt} reader_ge_1ms=${kvm_reader_ge_1ms} reader_ge_4ms=${kvm_reader_ge_4ms} nx_recover_hit=${nx_recover_hit} ge1_in_nx_recover=${ge1_in_nx_recover}"
+echo "[ok] counters: gp_end=${gp_end_seen_total} call_main=${call_main_cnt} memslot=${call_memslot_cnt} ioeventfd=${call_ioeventfd_cnt} reader_ge_1ms=${kvm_reader_ge_1ms} reader_ge_4ms=${kvm_reader_ge_4ms}"
+if (( kvm_reader_ge_1ms > 0 )); then
+	echo "[info] ge1 samples found, printing preemptor attribution:"
+	print_bt_top_count_map "@kvm_reader_ge1_max_offcpu_next_pid" 5 "top ge1 max-offcpu next_pid"
+	print_bt_top_count_map "@kvm_reader_ge1_max_offcpu_prev_state" 5 "top ge1 max-offcpu prev_state"
+fi
