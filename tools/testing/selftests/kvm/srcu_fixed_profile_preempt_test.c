@@ -31,6 +31,8 @@ static struct kvm_vm *g_vm;
 static struct kvm_vcpu *g_vcpu;
 static bool g_use_user_memory2, g_preempt_enable;
 static volatile bool g_preempt_stop;
+#define CREATE_THREAD_OR_DIE(tid, fn, tag) do { int e__ = pthread_create(&(tid), NULL, (fn), NULL); \
+	TEST_ASSERT(!e__, "pthread_create(" tag ") failed: %d", e__); } while (0)
 static void bind_self_to_cpu(int cpu, const char *who)
 {
 	cpu_set_t set;
@@ -58,18 +60,14 @@ static void set_memslot(struct kvm_vm *vm, uint64_t size, void *hva)
 }
 static void guest_main(void)
 {
-	uint64_t start, now, target_cycles;
-	/* 中文注释：让 guest 在 SRCU 读侧窗口里忙等较长时间。 */
+	uint64_t start, target_cycles;
+	/* Keep guest in a long SRCU read-side window. */
 	GUEST_SYNC(0);
 	GUEST_ASSERT(guest_tsc_khz);
 	target_cycles = guest_tsc_khz * guest_spin_duration_ms;
 	start = rdtsc();
-	while (!guest_stop) {
-		now = rdtsc();
-		if (now - start >= target_cycles)
-			break;
+	while (!guest_stop && rdtsc() - start < target_cycles)
 		asm volatile("pause" ::: "memory");
-	}
 	GUEST_DONE();
 }
 static void *vcpu_thread_main(void *arg)
@@ -99,7 +97,7 @@ static void *preempt_thread_main(void *arg)
 	struct timespec t0, t1;
 	int ar;
 	(void)arg;
-	/* 中文注释：抢占线程与主线程/vcpu 同核，周期性忙等制造切出。 */
+	/* Run on the same CPU and periodically busy-wait to force descheduling. */
 	bind_self_to_cpu(PREEMPT_CPU, "preempt");
 	ar = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 	if (ar)
@@ -123,20 +121,15 @@ static void *preempt_thread_main(void *arg)
 	}
 	return NULL;
 }
-int main(int argc, char *argv[])
+int main(void)
 {
 	pthread_t vcpu_thread, preempt_thread;
 	size_t mem_size;
 	void *mem;
-	int eventfd, ret;
-	if (argc != 2 || (strcmp(argv[1], "0") && strcmp(argv[1], "1"))) {
-		pr_info("Usage: %s <storm>\n", argv[0]);
-		pr_info("  storm: 0|1 (compat only, now ignored)\n");
-		return 2;
-	}
+	int eventfd;
 	g_preempt_enable = getenv("PREEMPT_SIM") && strcmp(getenv("PREEMPT_SIM"), "0");
 	if (g_preempt_enable) {
-		/* 中文注释：主线程绑核，保证 memslot reload 也在同核竞争域。 */
+		/* Pin main thread so memslot reloads share the same contention domain. */
 		bind_self_to_cpu(PREEMPT_CPU, "main");
 		pr_info("preempt sim enabled: cpu=%d fifo_prio=%d busy_us=%u sleep_us=%u\n",
 			PREEMPT_CPU, PREEMPT_FIFO_PRIO, PREEMPT_BUSY_US, PREEMPT_SLEEP_US);
@@ -152,11 +145,9 @@ int main(int argc, char *argv[])
 	guest_spin_duration_ms = FIXED_SPIN_DURATION_MS;
 	sync_global_to_guest(g_vm, guest_stop);
 	sync_global_to_guest(g_vm, guest_spin_duration_ms);
-	ret = pthread_create(&vcpu_thread, NULL, vcpu_thread_main, NULL);
-	TEST_ASSERT(!ret, "pthread_create(vcpu_thread sync) failed: %d", ret);
+	CREATE_THREAD_OR_DIE(vcpu_thread, vcpu_thread_main, "vcpu_thread sync");
 	pthread_join(vcpu_thread, NULL);
-	ret = pthread_create(&vcpu_thread, NULL, vcpu_thread_main, NULL);
-	TEST_ASSERT(!ret, "pthread_create(vcpu_thread loop) failed: %d", ret);
+	CREATE_THREAD_OR_DIE(vcpu_thread, vcpu_thread_main, "vcpu_thread loop");
 	eventfd = kvm_new_eventfd();
 	for (uint32_t i = 0; i < FIXED_PRE_BURST; i++) {
 		ioeventfd_update(g_vm, TEST_IOEVENT_ADDR, eventfd, false);
@@ -168,8 +159,7 @@ int main(int argc, char *argv[])
 	usleep(FIXED_GP_SETTLE_US);
 	if (g_preempt_enable) {
 		g_preempt_stop = false;
-		ret = pthread_create(&preempt_thread, NULL, preempt_thread_main, NULL);
-		TEST_ASSERT(!ret, "pthread_create(preempt_thread) failed: %d", ret);
+		CREATE_THREAD_OR_DIE(preempt_thread, preempt_thread_main, "preempt_thread");
 	}
 	for (uint32_t i = 0; i < FIXED_RELOADS; i++) {
 		set_memslot(g_vm, 0, mem);
